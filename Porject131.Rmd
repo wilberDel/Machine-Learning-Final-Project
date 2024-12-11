@@ -1,0 +1,620 @@
+---
+title: "Using Spotify song attributes to determine whether or not I like a song"
+author: "Wilber Delgado"
+output:
+  html_document:
+    code_folding: hide
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+# Introduction 
+
+Like many people, I have always been interested in finding new music, but I have found that I am a very picky music listener. This sometimes makes it quite difficult for people and music apps to "put me on" new music. I feel like a lot of the music I like tends to depend on the vibe of the song as I generally like songs with a chiller vibe, however I do find interest in music like Techno or songs that somewhat combine EDM and Rock. Although music apps have their own models that suggest songs, I hardly find myself getting new music from apps' recommendations. 
+
+After looking around kaggle for a while I found a data set that had songs pulled from a spotify playslist and their attributes and it reminded me of how much I enjoy music and gave me the idea to try and make a machine learning model that could identify whether or not I like a song based on its attributes. This was also what the original poster of the [Kaggle data set]() had done, which was make a machine learning model that could identify songs that he liked or disliked based the attributes of the songs from a playlist they had made. 
+
+# Tidying data
+
+## Collecting/Setting up data
+
+Originally I planned to use the data set that I had found on kaggle as many of the songs I had first seen were familiar, however when I looked at the full data set I noticed that a majority of the songs I had never seen or heard which would have resulted in a lot of songs being numbered "0" as in i do not like them. To not have this negatively affect my project I decided it would be better if I created a playlist myself and added songs that I likes and did not like. Using the spotify API was not the easiest thing to do as I am not advanced in python. However after much trial and error I was able to use Google colab to read the playlist I made for this project and retrieve the songs' attributes into a csv file. The only issue I had was that since my playlist was 1000 songs the program would get an error after running reading and retrieving some of the songs attributes. For this reason I made it to where it would read 100 songs at a time and I ended up with 10 csv files. 
+
+I then combined all the csv files into 1. I had to exclude "df6.csv" as there was a song in that range that did not have attributes so it was causing errors. To fix this I went back and added more songs to my playlist and retrieved 100 more songs so I can have a final total of 1000 songs in my data set.
+
+
+```{r}
+library(dplyr)
+library(workflows)
+library(tibble)
+library(ggplot2)
+library(corrplot)
+library(readr)
+library(tidymodels)
+library(xgboost)
+library(kknn)
+library(glmnet)
+library(parsnip)
+library(kernlab)
+library(recipes)
+library(rsample)
+
+setwd("/Users/wilberdelgado/Downloads/drive-download-20240314T043832Z-001")
+
+csv_files <- list.files(pattern = "\\.csv$")
+csv_files <- csv_files[csv_files != "df6.csv"]
+
+list_of_dfs <- lapply(csv_files, read.csv)
+
+combined_df <- bind_rows(list_of_dfs)
+
+```
+
+After combining the csv files I dropped columns that I did not require such as id, uri, analysis_url, etc. I also added a column names "opinion" which would hold my opinion about a song where "1" means that I like the song and "0" means I dislike the song. After adding the "opinion" column, I exported my combined data set, and manually marked the songs I like with the number 1. After this, rather than entering all the 0s manually I decided that I would just have R replace any "NA" under the "opinion" column to be a 0. 
+
+```{r}
+
+combined_df <- select(combined_df, -c(X, type, id, uri, track_href, analysis_url))
+
+# Add a blank column named "opinion" 
+combined_df$opinion <- NA  
+
+output_file_path <- "/Users/wilberdelgado/Downloads/combined_songs.csv"
+
+# commented for rerun purposes
+# write.csv(combined_df, output_file_path, row.names = TRUE)
+```
+
+
+
+```{r}
+
+songs <- read.csv("/Users/wilberdelgado/Downloads/project_songs.csv")
+
+songs <- songs[ , !(names(songs) %in% c("X"))]
+
+songs$opinion[is.na(songs$opinion)] <- 0
+
+
+head(songs)
+
+```
+```{r}
+set.seed(123) #Set seed for reproductibility 
+
+str(songs)
+
+```
+After looking at the variables in my data set, key, mode, and time_signature are integers int and likely represent categorical data since they denote specific categories. I decided to conver them to factors for more meaningful analysis. Also my opinion column it meant to be a binary outcome so I decided to also convert it into a factor to clearly denote it as a categorical outcome for classification tasks
+
+```{r}
+
+
+songs$key <- as.factor(songs$key)
+songs$mode <- as.factor(songs$mode)
+songs$time_signature <- as.factor(songs$time_signature)
+
+songs$opinion <- as.factor(songs$opinion)
+
+```
+
+```{r}
+summary(songs)
+```
+
+I noticed that the minimum tempo was 0 and that's usually not the case for a song, so I looked into it and found that the song was an interlude and would not be beneficial for training models so I removed it.
+```{r}
+
+
+summary(songs$tempo[songs$tempo == 0])
+
+songs[songs$tempo == 0, ]
+
+
+# Removing songs with 0 tempo
+songs <- songs[songs$tempo != 0, ]
+
+```
+
+## Missing data
+
+Fortunately none of my columns had any missing data.
+```{r}
+colSums(is.na(songs))
+
+```
+# EDA
+
+```{r}
+opinion_counts <- table(songs$opinion)
+
+# Create the bar plot
+barplot(opinion_counts, main = "Histogram of Song Opinions", xlab = "Opinion", ylab = "Frequency", names.arg = c("Disliked", "Liked"))
+
+```
+
+
+I found that my data set was imbalanced with having more disliked songs than likes so I decided to even them out. the even split turned out to be 426 liked songs and 426 disliked songs. 
+```{r}
+liked_songs <- filter(songs, opinion == 1)
+not_liked_songs <- filter(songs, opinion == 0)
+
+# Undersample the not liked songs to match the number of liked songs
+not_liked_songs_undersampled <- sample_n(not_liked_songs, size = nrow(liked_songs))
+
+# Combine back to get the balanced dataset
+songs <- bind_rows(liked_songs, not_liked_songs_undersampled)
+
+```
+
+
+```{r}
+# Plot a histogram to visualize the distribution of 'danceability'
+hist(songs$danceability, main="Danceability Distribution", xlab="Danceability", col="blue", breaks=30)
+
+
+```
+
+
+The danceability distribution shows a  relatively normal distribution which can work quite well for my machine learning models. 
+
+```{r}
+hist(songs$energy, main="Histogram of Energy", xlab="Energy", col="blue", breaks=30)
+```
+
+
+Given the distribution, the energy variable does not appear to have any concerning outliers or skewness that would require data transformation before modeling. 
+```{r}
+hist(songs$loudness, main="Histogram of Loudness", xlab="Loudness", col="blue", breaks=30)
+```
+
+```{r}
+hist(songs$valence, main="Histogram of Valence", xlab="Valence", col="blue", breaks=30)
+```
+
+```{r}
+hist(songs$tempo, main="Histogram of Tempo", xlab="Tempo", col="blue", breaks=30)
+```
+
+```{r}
+hist(songs$duration_ms, main="Histogram of duration_ms", xlab="duration_ms", col="blue", breaks=30)
+```
+
+Based on all of the histograms, the variables seem to all be normally distributed which can be beneficial for my models.
+
+Next up I look at the factored variables. 
+
+```{r}
+key_counts <- table(songs$key)
+
+# Create the bar plot
+barplot(key_counts, main = "Histogram of Key", xlab = "Key", ylab = "Frequency", col="blue")
+
+```
+
+The histogram of key shows a wide spread value of keys. Key 1 seemed to be the most common from my playlist.
+
+```{r}
+mode_counts <- table(songs$mode)
+
+# Create the bar plot
+barplot(mode_counts, main = "Histogram of Mode", xlab = "Mode", ylab = "Frequency", col="blue")
+
+```
+
+The mode shows that that the modality of most of the tracks on my playlist are Major. 
+
+```{r}
+timesignature_counts <- table(songs$time_signature)
+
+# Create the bar plot
+barplot(timesignature_counts, main = "Histogram of Time Signature", xlab = "Time Signature", ylab = "Frequency", col = "blue")
+
+```
+
+The time signature histogram indicates that a majority of my songs have 4 beats in each bar. 
+
+
+```{r}
+# Find correlations between numeric predictors only
+numeric_vars <- songs[sapply(songs, is.numeric)]
+cor_matrix <- cor(numeric_vars, use="complete.obs")
+
+
+corrplot(cor_matrix, method="circle", addCoef.col="black", number.cex = 0.6, tl.cex=0.6, cl.cex=0.6)
+
+```
+
+Based on the correlation plot, the highest correlated variables are loudness and energy. Other than that the correlation plot does not show any other variables that are too highly coordinated or too low coordinated. 
+
+```{r}
+ggplot(songs, aes(x=loudness, y=energy, color=factor(opinion))) +
+  geom_point(alpha=0.5) +
+  scale_color_manual(values=c('0'='red', '1'='blue')) +
+  labs(title="Loudness vs. Energy Colored by Opinion",
+       x="Loudness", y="Energy", color="Opinion") +
+  theme_minimal()
+
+```
+
+After plotting the variables Energy and Loudness together, we can see that they are lots of points that overlap eachother, which might be a concern for model training, however it also makes sense that they correlate highly to one another because if a song is loud, it typically also has lots of energy in it. Overall their realtionship seems linear, and I do not think it will cause any issues with my models.
+
+# Setting up for Models
+
+
+## Splitting the data
+
+First I go ahead and split the data with 70/30, with "opinion" stratified. 
+```{r}
+# Splitting the dataset
+split <- initial_split(songs, prop = .7, strata = opinion)
+
+training_set <- training(split)
+testing_set <- testing(split)
+
+```
+
+## Recipe
+
+I then set up my recipe, which excludes song_titles and artists names as they are character variables that have no purpose in training a model. 
+
+```{r}
+recipe <- recipe(opinion ~ ., data = training_set) %>%
+  step_rm(song_title, artist) %>% 
+  step_zv(all_predictors()) %>%  
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_normalize(all_numeric(), -all_outcomes())
+
+# Prepare the recipe with the training data
+prepared_recipe <- prep(recipe, training = training_set)
+
+# Bake the recipe
+baked_data <- bake(prepared_recipe, new_data = NULL) 
+
+colnames(baked_data)
+
+```
+
+I then stratify my cross validation on opinion, my response variable. 
+
+```{r}
+songs_fold <- vfold_cv(training_set, v = 10, strata = opinion)
+```
+
+
+# Model building
+
+
+## Fit Models
+
+The models I will be working with will be logistic regression, knn, random forest, boosted forest and support vector machine. For these models I set up the models with the parameters I would like to tune. I will set up the workflow with the models and recipe. I will then creating tuning grids for the parameters which will be tuned. The I will tune the model and specify the workflow and save the tuned models to an RDS file to save time and computer power on running the models
+
+
+```{r}
+# Define the logistic model specification
+logistic_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+
+# Define the knn model specification 
+knn_spec <- nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+# Define the random forest model specification 
+rf_spec <- rand_forest(
+  trees = tune(),       
+  mtry = tune(),        
+  min_n = tune()        
+) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+# Define the bosted trees model specification 
+boosted_spec <- boost_tree(
+    trees = tune(),
+    min_n = tune(),
+    learn_rate = tune()
+  ) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+
+# Define the support vector machine model specification 
+svm_spec <- svm_linear() %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+
+```
+
+## Work flow
+```{r}
+# Create the workflows
+logistic_wf <- workflow() %>%
+  add_model(logistic_spec) %>%
+  add_recipe(recipe)
+
+knn_wf <- workflow() %>%
+  add_model(knn_spec) %>%
+  add_recipe(recipe)
+
+rf_wf <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(recipe)
+
+boosted_wf <- workflow() %>%
+  add_model(boosted_spec) %>%
+  add_recipe(recipe)
+
+svm_wf <- workflow() %>%
+  add_model(svm_spec) %>%
+  add_recipe(recipe)
+
+
+
+```
+
+## Grids
+```{r}
+# Define a tuning grids
+
+knn_grid <- grid_regular(neighbors(range = c(1, 20)), levels = 5)
+
+rf_grid <- grid_regular(
+  mtry(range = c(1, 12)), 
+  trees(range = c(200,1000)), 
+  min_n(range = c(5,20)), 
+  levels = 8)
+
+
+boosted_grid <- grid_regular(
+    trees(range = c(50, 500)),
+    min_n(range = c(5, 20)),
+    learn_rate(range = c(0.01, 0.3)),
+    levels = 5
+)
+
+```
+
+## Results
+```{r}
+
+logistic_res <- tune_grid(
+  logistic_wf,
+  resamples = songs_fold)
+
+
+knn_res <- tune_grid(
+  knn_wf,
+  resamples = songs_fold,  
+  grid = knn_grid
+)
+
+# commented out for rerun/knitting purposes
+# rf_res <- tune_grid(
+#  rf_wf,
+#  resamples = songs_fold,
+#  grid = rf_grid
+#)
+
+
+#boosted_res <- tune_grid(
+# boosted_wf,
+#  resamples = songs_fold,
+#  grid = boosted_grid  
+#)
+
+#svm_res <- fit_resamples(
+#  svm_wf,
+#  resamples = songs_fold
+#)
+```
+
+```{r}
+# write_rds(rf_res, file = "/Users/wilberdelgado/Downloads/rf.rds")
+# write_rds(boosted_res, file = "/Users/wilberdelgado/Downloads/boosted.rds")
+# write_rds(svm_res, file = "/Users/wilberdelgado/Downloads/svm.rds")
+```
+
+```{r}
+rf_res <- read_rds(file = "/Users/wilberdelgado/Downloads/rf.rds")
+boosted_res <- read_rds(file = "/Users/wilberdelgado/Downloads/boosted.rds")
+svm_res <- read_rds(file = "/Users/wilberdelgado/Downloads/svm.rds")
+```
+
+# Model Autoplots
+
+```{r}
+# autoplot for logistic regression tuning results
+autoplot(logistic_res)
+```
+
+```{r}
+# autoplot for knn tuning results
+autoplot(knn_res)
+```
+
+Based on the auto plot of the KNN model, we can see that the most accurate neighbor is from about 3-5. We can also see that the ROC_AUC and accuracy are fairly coordinated to one another. 
+
+```{r, fig.width=15, fig.height=6}
+# autoplot for random forest tuning results
+autoplot(rf_res)
+```
+
+```{r}
+# autoplot for boosted trees tuning results
+autoplot(boosted_res)
+```
+
+Based on the autoplot we can see that node size 5 at rate 1.4288 has the highest accuracy. 
+
+```{r}
+# Logistic Regression
+logistic_metrics <- collect_metrics(logistic_res)
+
+
+# KNN - Replace 'knn_results' with the actual results object for KNN
+knn_metrics <- collect_metrics(knn_res)
+
+# Random Forest - Replace 'rf_res' with the actual results object for Random Forest
+rf_metrics <- collect_metrics(rf_res)
+
+# Boosted Trees - Replace 'boosted_res' with the actual results object for Boosted Trees
+boosted_metrics <- collect_metrics(boosted_res)
+
+# SVM - Replace 'svm_res' with the actual results object for SVM
+svm_metrics <- collect_metrics(svm_res)
+
+```
+
+
+
+
+
+```{r}
+
+# Extract mean accuracy from metrics
+extract_mean_accuracy <- function(metrics) {
+  metrics %>%
+    filter(.metric == "accuracy") %>%
+    summarise(mean_accuracy = mean(mean, na.rm = TRUE), .groups = 'drop') %>%
+    pull(mean_accuracy)
+}
+
+# Extract mean ROC AUC from metrics
+extract_mean_roc_auc <- function(metrics) {
+  metrics %>%
+    filter(.metric == "roc_auc") %>%
+    summarise(mean_roc_auc = mean(mean, na.rm = TRUE), .groups = 'drop') %>%
+    pull(mean_roc_auc)
+}
+
+
+# Calculate accuracies and ROC AUCs
+logistic_accuracy <- extract_mean_accuracy(logistic_metrics)
+logistic_roc_auc <- extract_mean_roc_auc(logistic_metrics)
+
+knn_accuracy <- extract_mean_accuracy(knn_metrics)
+knn_roc_auc <- extract_mean_roc_auc(knn_metrics)
+
+rf_accuracy <- extract_mean_accuracy(rf_metrics)
+rf_roc_auc <- extract_mean_roc_auc(rf_metrics)
+
+boosted_accuracy <- extract_mean_accuracy(boosted_metrics)
+boosted_roc_auc <- extract_mean_roc_auc(boosted_metrics)
+
+svm_accuracy <- extract_mean_accuracy(svm_metrics)
+svm_roc_auc <- extract_mean_roc_auc(svm_metrics)
+
+# Combine into one table
+model_performance <- tibble(
+  Model = c("Logistic Regression", "KNN", "Random Forest", "Boosted Trees", "SVM"),
+  Accuracy = c(logistic_accuracy, knn_accuracy, rf_accuracy, boosted_accuracy, svm_accuracy),
+  ROC_AUC = c(logistic_roc_auc, knn_roc_auc, rf_roc_auc, boosted_roc_auc, svm_roc_auc)
+)
+
+model_performance
+```
+
+
+Based on the provided results, the Random Forest model shows the highest performance with an accuracy of approximately 0.544 and an ROC_AUC of about 0.573. The Boosted Trees model follows closely, with an accuracy of around 0.540 and an ROC_AUC of 0.548. These two models outperform the other three in terms of both metrics. Given their superior performance, Random Forest and Boosted Trees would be the chosen models to fit to the testing set for further evaluation. It is important to note that while KNN has a slightly lower accuracy than Boosted Trees, it does have a higher ROC_AUC, which suggests it might be better at ranking positive instances over negative ones. However, Boosted Trees' balance between accuracy and ROC_AUC makes it a strong candidate. 
+
+
+# Testing the best models
+
+```{r}
+
+training_set <- training_set %>%
+  select(-artist, -song_title)
+
+testing_set <- testing_set %>%
+  select(-artist, -song_title)
+
+
+best_rf <- select_best(rf_res, metric = "roc_auc")
+
+# Refit the Random Forest model with the best hyperparameters
+final_rf_model <- rand_forest(trees = best_rf$trees, mtry = best_rf$mtry, min_n = best_rf$min_n) %>%
+  set_engine("ranger") %>%
+  set_mode("classification") %>%
+  fit(opinion ~ ., data = training_set)
+
+# Make predictions on the test set
+rf_predictions <- predict(final_rf_model, testing_set) %>%
+  bind_cols(testing_set)
+
+rf_results <- rf_predictions %>%
+  metrics(truth = opinion, estimate = .pred_class)
+
+print(rf_results)
+
+```
+
+
+```{r}
+best_boosted <- select_best(boosted_res, metric = "roc_auc")
+
+# Refit the Boosted Trees model with the best hyperparameters
+final_boosted_model <- boost_tree(trees = best_boosted$trees, min_n = best_boosted$min_n, learn_rate = best_boosted$learn_rate) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification") %>%
+  fit(opinion ~ ., data = training_set)
+
+# Make predictions on the test set
+boosted_predictions <- predict(final_boosted_model, testing_set) %>%
+  bind_cols(testing_set)
+
+boosted_results <- boosted_predictions %>%
+  metrics(truth = opinion, estimate = .pred_class)
+
+print(boosted_results)
+
+
+
+```
+
+```{r}
+# Confusion Matrix for Random Forest
+rf_conf_mat <- rf_predictions %>%
+  conf_mat(truth = opinion, estimate = .pred_class)
+
+# Plot the confusion matrix for Random Forest
+autoplot(rf_conf_mat, type = "heatmap") +
+  labs(title = "Random Forest Confusion Matrix")
+
+
+```
+
+The Random Forest model's confusion matrix shows that the model correctly predicted 80 songs as "liked" and 65 as "disliked." These numbers suggest a robust accuracy in classification, though the model is not without errors—63 liked songs were misclassified as disliked, and 48 disliked songs were mistakenly identified as liked. 
+
+```{r}
+# Confusion Matrix for Boosted Trees
+boosted_conf_mat <- boosted_predictions %>%
+  conf_mat(truth = opinion, estimate = .pred_class)
+
+# Plot the confusion matrix for Boosted Trees
+autoplot(boosted_conf_mat, type = "heatmap") +
+  labs(title = "Boosted Trees Confusion Matrix")
+
+```
+
+The confusion matrix for the Boosted Trees model demonstrates a reasonably balanced predictive performance with some room for improvement. The model correctly identified 72 songs as "disliked" and 62 songs as "liked," which suggests a fair degree of accuracy. However, there are a significant number of misclassifications as well, with 66 "disliked" songs predicted as "liked" and 56 "liked" songs predicted as "disliked." 
+
+
+# Conclusion
+
+Based on my results Logistic regression and SV models seemed to perform the worst, and Random forest and boosted treees performed the best. However, the best was still had quite low accuracies and auc_roc. 
+
+Overall, I feel as though my results were underwhelming. Although not included, I did try making changes to my project to see if it would be possible to get better results from my model, but it was quite difficult to keep editing and running models on MacBook, as it would take 15-30 minutes to run them. I think there could possibly be issues with my recipe, or the variables from the songs of my playlist.
+
+I do think that my dataset could have caused some issues considering that a lot of the songs were from the same or similar artists. This could have negatively impacted my models and could have caused some confusion on what I do and do not like. Looking back, when I created the playlist, I figured I would add whole albums, as I am a very picky music listener, and although I may love some songs from an albums, I also dislike songs from those same albums. Also, rather than handpicking each song to add, I used spotifys recommendations from when I would add a song to my playlist, and those recommendations are derived from similar songs as to the ones I hand picked. Reflecting on this I believe Spotifys song recommendations are derived from the songs attributes, so they give me sonsg with similar attributes as to the ones I like, and I did not necessarely like all those songs, but just added them as it was much easier than individually looking up every song. Taking this into consideration, if I have a playlist with not much variability when it comes to the songs' attributes, but my opinion is different on those songs, I can see that it probably played a big role in my models' low accuracy as I did not provide enough variety when it came to the songs' attributes.
+
+# Sources
+
+The original dataset that I had found was from [Kaggle](https://www.kaggle.com/datasets/geomack/spotifyclassification?resource=download). I then used the [Spotify API](https://developer.spotify.com/documentation/web-api) to retrieve the attributes from the playlist I made myself. 
